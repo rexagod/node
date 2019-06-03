@@ -15,20 +15,20 @@
 // Do not include anything from src/heap here!
 #include "include/v8-internal.h"
 #include "include/v8.h"
-#include "src/accessors.h"
-#include "src/allocation.h"
-#include "src/assert-scope.h"
 #include "src/base/atomic-utils.h"
-#include "src/globals.h"
-#include "src/heap-symbols.h"
-#include "src/objects.h"
+#include "src/builtins/accessors.h"
+#include "src/common/assert-scope.h"
+#include "src/common/globals.h"
+#include "src/init/heap-symbols.h"
 #include "src/objects/allocation-site.h"
 #include "src/objects/fixed-array.h"
 #include "src/objects/heap-object.h"
+#include "src/objects/objects.h"
 #include "src/objects/smi.h"
 #include "src/objects/string-table.h"
-#include "src/roots.h"
-#include "src/visitors.h"
+#include "src/objects/visitors.h"
+#include "src/roots/roots.h"
+#include "src/utils/allocation.h"
 #include "testing/gtest/include/gtest/gtest_prod.h"
 
 namespace v8 {
@@ -129,7 +129,8 @@ enum class GarbageCollectionReason {
   kSamplingProfiler = 19,
   kSnapshotCreator = 20,
   kTesting = 21,
-  kExternalFinalize = 22
+  kExternalFinalize = 22,
+  kGlobalAllocationLimit = 23,
   // If you add new items here, then update the incremental_marking_reason,
   // mark_compact_reason, and scavenge_reason counters in counters.h.
   // Also update src/tools/metrics/histograms/histograms.xml in chromium.
@@ -159,12 +160,12 @@ class AllocationResult {
       : object_(object) {
     // AllocationResults can't return Smis, which are used to represent
     // failure and the space to retry in.
-    CHECK(!object->IsSmi());
+    CHECK(!object.IsSmi());
   }
 
   AllocationResult() : object_(Smi::FromInt(NEW_SPACE)) {}
 
-  inline bool IsRetry() { return object_->IsSmi(); }
+  inline bool IsRetry() { return object_.IsSmi(); }
   inline HeapObject ToObjectChecked();
   inline AllocationSpace RetrySpace();
 
@@ -211,6 +212,8 @@ class Heap {
   EphemeronRememberedSet ephemeron_remembered_set_;
   enum FindMementoMode { kForRuntime, kForGC };
 
+  enum class HeapGrowingMode { kSlow, kConservative, kMinimal, kDefault };
+
   enum HeapState {
     NOT_IN_GC,
     SCAVENGE,
@@ -235,8 +238,6 @@ class Heap {
   };
   using Reservation = std::vector<Chunk>;
 
-  static const int kInitalOldGenerationLimitFactor = 2;
-
 #if V8_OS_ANDROID
   // Don't apply pointer multiplier on Android since it has no swap space and
   // should instead adapt it's heap size based on available physical memory.
@@ -246,12 +247,19 @@ class Heap {
   static const int kPointerMultiplier = i::kSystemPointerSize / 4;
 #endif
 
-  // Semi-space size needs to be a multiple of page size.
-  static const size_t kMinSemiSpaceSizeInKB = 512 * kPointerMultiplier;
-  static const size_t kMaxSemiSpaceSizeInKB = 8192 * kPointerMultiplier;
+  static const size_t kMaxInitialOldGenerationSize =
+      256 * MB * kPointerMultiplier;
 
-  STATIC_ASSERT(kMinSemiSpaceSizeInKB* KB % (1 << kPageSizeBits) == 0);
-  STATIC_ASSERT(kMaxSemiSpaceSizeInKB* KB % (1 << kPageSizeBits) == 0);
+  // These constants control heap configuration based on the physical memory.
+  static const size_t kPhysicalMemoryToOldSpaceRatio = 4;
+  static const size_t kOldSpaceToSemiSpaceRatio = 128;
+  static const size_t kOldSpaceToSemiSpaceRatioLowMemory = 256;
+  static const size_t kLowMemory = 512 * MB;
+  static const size_t kMinSemiSpaceSize = 512 * KB * kPointerMultiplier;
+  static const size_t kMaxSemiSpaceSize = 8192 * KB * kPointerMultiplier;
+
+  STATIC_ASSERT(kMinSemiSpaceSize % (1 << kPageSizeBits) == 0);
+  STATIC_ASSERT(kMaxSemiSpaceSize % (1 << kPageSizeBits) == 0);
 
   static const int kTraceRingBufferSize = 512;
   static const int kStacktraceBufferSize = 512;
@@ -351,6 +359,12 @@ class Heap {
   // by pointer size.
   static inline void CopyBlock(Address dst, Address src, int byte_size);
 
+  // Executes generational and/or marking write barrier for a [start, end) range
+  // of non-weak slots inside |object|.
+  template <typename TSlot>
+  V8_EXPORT_PRIVATE void WriteBarrierForRange(HeapObject object, TSlot start,
+                                              TSlot end);
+
   V8_EXPORT_PRIVATE static void WriteBarrierForCodeSlow(Code host);
   V8_EXPORT_PRIVATE static void GenerationalBarrierSlow(HeapObject object,
                                                         Address slot,
@@ -359,15 +373,11 @@ class Heap {
                                                  Address key_slot);
   V8_EXPORT_PRIVATE static void EphemeronKeyWriteBarrierFromCode(
       Address raw_object, Address address, Isolate* isolate);
-  V8_EXPORT_PRIVATE static void GenerationalBarrierForElementsSlow(
-      Heap* heap, FixedArray array, int offset, int length);
   V8_EXPORT_PRIVATE static void GenerationalBarrierForCodeSlow(
       Code host, RelocInfo* rinfo, HeapObject value);
   V8_EXPORT_PRIVATE static void MarkingBarrierSlow(HeapObject object,
                                                    Address slot,
                                                    HeapObject value);
-  V8_EXPORT_PRIVATE static void MarkingBarrierForElementsSlow(
-      Heap* heap, HeapObject object);
   V8_EXPORT_PRIVATE static void MarkingBarrierForCodeSlow(Code host,
                                                           RelocInfo* rinfo,
                                                           HeapObject value);
@@ -389,14 +399,16 @@ class Heap {
   inline Address* OldSpaceAllocationTopAddress();
   inline Address* OldSpaceAllocationLimitAddress();
 
-  // Move len elements within a given array from src_index index to dst_index
-  // index.
-  void MoveElements(FixedArray array, int dst_index, int src_index, int len,
-                    WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+  // Move len non-weak tagged elements from src_slot to dst_slot of dst_object.
+  // The source and destination memory ranges can overlap.
+  void MoveRange(HeapObject dst_object, ObjectSlot dst_slot,
+                 ObjectSlot src_slot, int len, WriteBarrierMode mode);
 
-  // Copy len elements from src_index of src array to dst_index of dst array.
-  void CopyElements(FixedArray dst, FixedArray src, int dst_index,
-                    int src_index, int len, WriteBarrierMode mode);
+  // Copy len non-weak tagged elements from src_slot to dst_slot of dst_object.
+  // The source and destination memory ranges must not overlap.
+  template <typename TSlot>
+  void CopyRange(HeapObject dst_object, TSlot dst_slot, TSlot src_slot, int len,
+                 WriteBarrierMode mode);
 
   // Initialize a filler object to keep the ability to iterate over the heap
   // when introducing gaps within pages. If slots could have been recorded in
@@ -459,7 +471,7 @@ class Heap {
 
   // Checks whether the given object is allowed to be migrated from it's
   // current space into the given destination space. Used for debugging.
-  bool AllowedToBeMigrated(HeapObject object, AllocationSpace dest);
+  bool AllowedToBeMigrated(Map map, HeapObject object, AllocationSpace dest);
 
   void CheckHandleCount();
 
@@ -468,6 +480,9 @@ class Heap {
 
   // Print short heap statistics.
   void PrintShortHeapStatistics();
+
+  // Dump heap statistics in JSON format.
+  void DumpJSONHeapStatistics(std::stringstream& stream);
 
   bool write_protect_code_memory() const { return write_protect_code_memory_; }
 
@@ -936,6 +951,8 @@ class Heap {
   void SetEmbedderStackStateForNextFinalizaton(
       EmbedderHeapTracer::EmbedderStackState stack_state);
 
+  EmbedderHeapTracer::TraceFlags flags_for_embedder_tracer() const;
+
   // ===========================================================================
   // External string table API. ================================================
   // ===========================================================================
@@ -1029,23 +1046,9 @@ class Heap {
   size_t InitialSemiSpaceSize() { return initial_semispace_size_; }
   size_t MaxOldGenerationSize() { return max_old_generation_size_; }
 
-  V8_EXPORT_PRIVATE static size_t ComputeMaxOldGenerationSize(
-      uint64_t physical_memory);
-
-  static size_t ComputeMaxSemiSpaceSize(uint64_t physical_memory) {
-    const uint64_t min_physical_memory = 512 * MB;
-    const uint64_t max_physical_memory = 3 * static_cast<uint64_t>(GB);
-
-    uint64_t capped_physical_memory =
-        Max(Min(physical_memory, max_physical_memory), min_physical_memory);
-    // linearly scale max semi-space size: (X-A)/(B-A)*(D-C)+C
-    size_t semi_space_size_in_kb =
-        static_cast<size_t>(((capped_physical_memory - min_physical_memory) *
-                             (kMaxSemiSpaceSizeInKB - kMinSemiSpaceSizeInKB)) /
-                                (max_physical_memory - min_physical_memory) +
-                            kMinSemiSpaceSizeInKB);
-    return RoundUp(semi_space_size_in_kb, (1 << kPageSizeBits) / KB);
-  }
+  V8_EXPORT_PRIVATE static void ComputeMaxSpaceSizes(uint64_t physical_memory,
+                                                     size_t* old_space_size,
+                                                     size_t* semi_space_size);
 
   // Returns the capacity of the heap in bytes w/o growing. Heap grows when
   // more spaces are needed until it reaches the limit.
@@ -1137,6 +1140,8 @@ class Heap {
            PromotedSinceLastGC();
   }
 
+  size_t EmbedderAllocationCounter() const;
+
   // This should be used only for testing.
   void set_old_generation_allocation_counter_at_last_gc(size_t new_value) {
     old_generation_allocation_counter_at_last_gc_ = new_value;
@@ -1167,6 +1172,8 @@ class Heap {
   // Returns the size of objects residing in non-new spaces.
   // Excludes external memory held by those objects.
   V8_EXPORT_PRIVATE size_t OldGenerationSizeOfObjects();
+
+  V8_EXPORT_PRIVATE size_t GlobalSizeOfObjects();
 
   // ===========================================================================
   // Prologue/epilogue callback methods.========================================
@@ -1275,10 +1282,21 @@ class Heap {
   // Mostly useful for debugging.
   bool GcSafeCodeContains(Code code, Address addr);
 
+  // Casts a heap object to a code object and checks if the inner_pointer is
+  // within the object.
+  Code GcSafeCastToCode(HeapObject object, Address inner_pointer);
+
+  // Returns the map of an object. Can be used during garbage collection, i.e.
+  // it supports a forwarded map. Fails if the map is not the code map.
+  Map GcSafeMapOfCodeSpaceObject(HeapObject object);
+
 // =============================================================================
 #ifdef VERIFY_HEAP
   // Verify the heap is in its normal state before or after a GC.
   V8_EXPORT_PRIVATE void Verify();
+  // Verify the read-only heap after all read-only heap objects have been
+  // created.
+  void VerifyReadOnlyHeap();
   void VerifyRememberedSetFor(HeapObject object);
 #endif
 
@@ -1488,6 +1506,12 @@ class Heap {
   V8_EXPORT_PRIVATE void ZapCodeObject(Address start_address,
                                        int size_in_bytes);
 
+  // Range write barrier implementation.
+  template <int kModeMask, typename TSlot>
+  V8_INLINE void WriteBarrierForRangeImpl(MemoryChunk* source_page,
+                                          HeapObject object, TSlot start_slot,
+                                          TSlot end_slot);
+
   // Deopts all code that contains allocation instruction which are tenured or
   // not tenured. Moreover it clears the pretenuring allocation site statistics.
   void ResetAllAllocationSitesDependentCode(AllocationType allocation);
@@ -1505,10 +1529,11 @@ class Heap {
 
   void ConfigureInitialOldGenerationSize();
 
+  double ComputeMutatorUtilization(const char* tag, double mutator_speed,
+                                   double gc_speed);
   bool HasLowYoungGenerationAllocationRate();
   bool HasLowOldGenerationAllocationRate();
-  double YoungGenerationMutatorUtilization();
-  double OldGenerationMutatorUtilization();
+  bool HasLowEmbedderAllocationRate();
 
   void ReduceNewSpaceSize();
 
@@ -1659,7 +1684,6 @@ class Heap {
   // Growing strategy. =========================================================
   // ===========================================================================
 
-  HeapController* heap_controller() { return heap_controller_.get(); }
   MemoryReducer* memory_reducer() { return memory_reducer_.get(); }
 
   // For some webpages RAIL mode does not switch from PERFORMANCE_LOAD.
@@ -1680,12 +1704,18 @@ class Heap {
 
   bool ShouldExpandOldGenerationOnSlowAllocation();
 
-  enum class HeapGrowingMode { kSlow, kConservative, kMinimal, kDefault };
-
   HeapGrowingMode CurrentHeapGrowingMode();
 
   enum class IncrementalMarkingLimit { kNoLimit, kSoftLimit, kHardLimit };
   IncrementalMarkingLimit IncrementalMarkingLimitReached();
+
+  bool UseGlobalMemoryScheduling() const {
+    return FLAG_global_gc_scheduling && local_embedder_heap_tracer();
+  }
+
+  size_t GlobalMemoryAvailable();
+
+  void RecomputeLimits(GarbageCollector collector);
 
   // ===========================================================================
   // Idle notification. ========================================================
@@ -1778,8 +1808,13 @@ class Heap {
 
   size_t code_range_size_ = 0;
   size_t max_semi_space_size_ = 8 * (kSystemPointerSize / 4) * MB;
-  size_t initial_semispace_size_ = kMinSemiSpaceSizeInKB * KB;
+  size_t initial_semispace_size_ = kMinSemiSpaceSize;
   size_t max_old_generation_size_ = 700ul * (kSystemPointerSize / 4) * MB;
+  // TODO(mlippautz): Clarify whether this should be take some embedder
+  // configurable limit into account.
+  size_t max_global_memory_size_ =
+      Min(static_cast<uint64_t>(std::numeric_limits<size_t>::max()),
+          static_cast<uint64_t>(max_old_generation_size_) * 2);
   size_t initial_max_old_generation_size_;
   size_t initial_max_old_generation_size_threshold_;
   size_t initial_old_generation_size_;
@@ -1888,6 +1923,7 @@ class Heap {
   // which collector to invoke, before expanding a paged space in the old
   // generation and on every allocation in large object space.
   size_t old_generation_allocation_limit_;
+  size_t global_allocation_limit_;
 
   // Indicates that inline bump-pointer allocation has been globally disabled
   // for all spaces. This is used to disable allocations in generated code.
@@ -1937,7 +1973,6 @@ class Heap {
   std::unique_ptr<ArrayBufferCollector> array_buffer_collector_;
   std::unique_ptr<MemoryAllocator> memory_allocator_;
   std::unique_ptr<StoreBuffer> store_buffer_;
-  std::unique_ptr<HeapController> heap_controller_;
   std::unique_ptr<IncrementalMarking> incremental_marking_;
   std::unique_ptr<ConcurrentMarking> concurrent_marking_;
   std::unique_ptr<GCIdleTimeHandler> gc_idle_time_handler_;
@@ -2037,7 +2072,6 @@ class Heap {
   friend class ConcurrentMarking;
   friend class GCCallbacksScope;
   friend class GCTracer;
-  friend class MemoryController;
   friend class HeapIterator;
   friend class IdleScavengeObserver;
   friend class IncrementalMarking;
@@ -2201,51 +2235,46 @@ class VerifySmisVisitor : public RootVisitor {
 };
 
 // Space iterator for iterating over all the paged spaces of the heap: Map
-// space, old space, code space and optionally read only space. Returns each
-// space in turn, and null when it is done.
+// space, old space and code space. Returns each space in turn, and null when it
+// is done.
 class V8_EXPORT_PRIVATE PagedSpaces {
  public:
-  enum class SpacesSpecifier { kSweepablePagedSpaces, kAllPagedSpaces };
-
-  explicit PagedSpaces(Heap* heap, SpacesSpecifier specifier =
-                                       SpacesSpecifier::kSweepablePagedSpaces)
-      : heap_(heap),
-        counter_(specifier == SpacesSpecifier::kAllPagedSpaces ? RO_SPACE
-                                                               : OLD_SPACE) {}
-  PagedSpace* next();
+  explicit PagedSpaces(Heap* heap) : heap_(heap), counter_(OLD_SPACE) {}
+  PagedSpace* Next();
 
  private:
   Heap* heap_;
   int counter_;
 };
 
-
-class SpaceIterator : public Malloced {
+class V8_EXPORT_PRIVATE SpaceIterator : public Malloced {
  public:
   explicit SpaceIterator(Heap* heap);
   virtual ~SpaceIterator();
 
-  bool has_next();
-  Space* next();
+  bool HasNext();
+  Space* Next();
 
  private:
   Heap* heap_;
   int current_space_;         // from enum AllocationSpace.
 };
 
-
-// A HeapIterator provides iteration over the whole heap. It
-// aggregates the specific iterators for the different spaces as
-// these can only iterate over one space only.
+// A HeapIterator provides iteration over the entire non-read-only heap. It
+// aggregates the specific iterators for the different spaces as these can only
+// iterate over one space only.
 //
-// HeapIterator ensures there is no allocation during its lifetime
-// (using an embedded DisallowHeapAllocation instance).
+// HeapIterator ensures there is no allocation during its lifetime (using an
+// embedded DisallowHeapAllocation instance).
 //
-// HeapIterator can skip free list nodes (that is, de-allocated heap
-// objects that still remain in the heap). As implementation of free
-// nodes filtering uses GC marks, it can't be used during MS/MC GC
-// phases. Also, it is forbidden to interrupt iteration in this mode,
-// as this will leave heap objects marked (and thus, unusable).
+// HeapIterator can skip free list nodes (that is, de-allocated heap objects
+// that still remain in the heap). As implementation of free nodes filtering
+// uses GC marks, it can't be used during MS/MC GC phases. Also, it is forbidden
+// to interrupt iteration in this mode, as this will leave heap objects marked
+// (and thus, unusable).
+//
+// See ReadOnlyHeapIterator if you need to iterate over read-only space objects,
+// or CombinedHeapIterator if you need to iterate over both heaps.
 class V8_EXPORT_PRIVATE HeapIterator {
  public:
   enum HeapObjectsFiltering { kNoFiltering, kFilterUnreachable };
@@ -2254,7 +2283,7 @@ class V8_EXPORT_PRIVATE HeapIterator {
                         HeapObjectsFiltering filtering = kNoFiltering);
   ~HeapIterator();
 
-  HeapObject next();
+  HeapObject Next();
 
  private:
   HeapObject NextObject();
@@ -2337,7 +2366,7 @@ class HeapObjectAllocationTracker {
 
 template <typename T>
 T ForwardingAddress(T heap_obj) {
-  MapWord map_word = heap_obj->map_word();
+  MapWord map_word = heap_obj.map_word();
 
   if (map_word.IsForwardingAddress()) {
     return T::cast(map_word.ToForwardingAddress());
