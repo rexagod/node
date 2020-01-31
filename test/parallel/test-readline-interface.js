@@ -147,7 +147,9 @@ function isWarned(emitter) {
   // Sending a single character with no newline
   {
     const fi = new FakeInput();
-    const rli = new readline.Interface(fi, {});
+    const rli = new readline.Interface(
+      { input: fi, output: fi, terminal: terminal }
+    );
     let called = false;
     rli.on('line', function(line) {
       called = true;
