@@ -1,6 +1,5 @@
 'use strict';
-const { mustNotCall } = require('../common');
-const { throws } = require('assert');
+const { mustNotCall, expectsError } = require('../common');
 const { Readable } = require('stream');
 
 async function* generate() {
@@ -9,16 +8,12 @@ async function* generate() {
 
 const stream = Readable.from(generate());
 
-stream.on('error', (err) => {
-  throws(() => {
-    throw err;
-  }, {
-    code: 'ERR_STREAM_NULL_VALUES',
-    name: 'TypeError',
-    message: 'May not write null values to stream'
-  });
-});
+stream.on('error', expectsError({
+  code: 'ERR_STREAM_NULL_VALUES',
+  name: 'TypeError',
+  message: 'May not write null values to stream'
+}));
 
-stream.on('data', (chunk) => {});
+stream.on('data', mustNotCall((chunk) => {}));
 
 stream.on('end', mustNotCall());
