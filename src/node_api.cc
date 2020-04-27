@@ -129,7 +129,6 @@ class ThreadSafeFunction : public node::AsyncResource {
       is_closing(false),
       context(context_),
       max_queue_size(max_queue_size_),
-      main_thread(uv_thread_self()),
       env(env_),
       finalize_data(finalize_data_),
       finalize_cb(finalize_cb_),
@@ -149,16 +148,36 @@ class ThreadSafeFunction : public node::AsyncResource {
 
   napi_status Push(void* data, napi_threadsafe_function_call_mode mode) {
     node::Mutex::ScopedLock lock(this->mutex);
-    uv_thread_t current_thread = uv_thread_self();
 
     while (queue.size() >= max_queue_size &&
         max_queue_size > 0 &&
         !is_closing) {
       if (mode == napi_tsfn_nonblocking) {
         return napi_queue_full;
-      } else if (uv_thread_equal(&current_thread, &main_thread)) {
-        return napi_would_deadlock;
       }
+
+      // Here we check if there is a Node.js event loop running on this thread.
+      // If there is, and our queue is full, we return `napi_would_deadlock`. We
+      // do this for two reasons:
+      //
+      // 1. If this is the thread on which our own event loop runs then we
+      //    cannot wait here because that will prevent our event loop from
+      //    running and emptying the very queue on which we are waiting.
+      //
+      // 2. If this is not the thread on which our own event loop runs then we
+      //    still cannot wait here because that allows the following sequence of
+      //    events:
+      //
+      //    1. JSThread1 calls JSThread2 and blocks while its queue is full and
+      //       because JSThread2's queue is also full.
+      //
+      //    2. JSThread2 calls JSThread1 before it's had a chance to remove an
+      //       item from its own queue and blocks because JSThread1's queue is
+      //       also full.
+      v8::Isolate* isolate = v8::Isolate::GetCurrent();
+      if (isolate != nullptr && node::GetCurrentEventLoop(isolate) != nullptr)
+        return napi_would_deadlock;
+
       cond->Wait(lock);
     }
 
@@ -438,7 +457,6 @@ class ThreadSafeFunction : public node::AsyncResource {
   // means we don't need the mutex to read them.
   void* context;
   size_t max_queue_size;
-  uv_thread_t main_thread;
 
   // These are variables accessed only from the loop thread.
   v8impl::Persistent<v8::Function> ref;
